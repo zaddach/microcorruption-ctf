@@ -171,7 +171,10 @@ class RegisterOperand(Operand):
         
     def get(self, cpu):
         mask = 0xff if self.size == 1 else 0xffff
-        return cpu.get_register(self.reg) & mask
+        if self.reg == 0:
+            return (cpu.get_register(self.reg) + 2) & mask
+        else:
+            return cpu.get_register(self.reg) & mask
         
     def set(self, cpu, val):
         mask = 0xff if self.size == 1 else 0xffff
@@ -233,7 +236,18 @@ class RegisterIndirectOperand(Operand):
         return cpu.memory.read(cpu.get_register(self.reg), self.size)
         
     def __str__(self):
-        return "%x(%s)" % (self.offset, self._regname(self.reg))
+        return "@%s" % (self._regname(self.reg), )
+        
+class PcIndirectOperand(Operand):
+    def __init__(self, size):
+        self.size = size
+        self.len = 0
+        
+    def get(self, cpu):
+        return cpu.memory.read(cpu.get_register(0) + 2, self.size)
+        
+    def __str__(self):
+        return "@%s" % (self._regname(0), )
         
 class RegisterIndirectIncrementOperand(Operand):
     def __init__(self, reg, size):
@@ -282,12 +296,12 @@ class RRAInst(UnaryInst):
         super().__init__(op, size)
         
     def eval(self, cpu):
-        val = op.get()
+        val = self.op.get(cpu)
         msb = val & (0x80 if self.size == 1 else 0x8000)
         result = (val >> 1) | msb
-        cpu.set_flag(CPUFlags.C, val & 1 != 0)
-        cpu.set_flag(CPUFlags.N, msb != 0)
-        cpu.set_flag(CPUFlags.Z, result == 0)
+#        cpu.set_flag(CPUFlags.C, val & 1 != 0)
+        cpu.set_flag(CPUFlags.N, cpu.get_flag(CPUFlags.N) or msb != 0)
+        cpu.set_flag(CPUFlags.Z, 0)
         cpu.set_flag(CPUFlags.V, False)
         self.op.set(cpu, result)
         super().eval(cpu)
@@ -305,9 +319,24 @@ class RRCInst(UnaryInst):
             old_c = 0
         result = old_c | (val >> 1)
         cpu.set_flag(CPUFlags.C, val & 1 != 0)
-        cpu.set_flag(CPUFlags.N, old_c != 0)
-        cpu.set_flag(CPUFlags.Z, result == 0)
+        cpu.set_flag(CPUFlags.N, cpu.get_flag(CPUFlags.N) or old_c != 0)
+        cpu.set_flag(CPUFlags.Z, cpu.get_flag(CPUFlags.Z) and result == 0)
         cpu.set_flag(CPUFlags.V, False)
+        self.op.set(cpu, result)
+        super().eval(cpu)
+        
+class SXTInst(UnaryInst):
+    def __init__(self, op, size):
+        self.mnem = "sxt"
+        super().__init__(op, size)
+        
+    def eval(self, cpu):
+        val = self.op.get(cpu)
+        result = val | (0xff00 if val & 0x80 != 0 else 0)
+        cpu.set_flag(CPUFlags.V, False)
+        cpu.set_flag(CPUFlags.C, result != 0)
+        cpu.set_flag(CPUFlags.N, result & 0x8000 != 0)
+        cpu.set_flag(CPUFlags.Z, result == 0)
         self.op.set(cpu, result)
         super().eval(cpu)
   
@@ -357,7 +386,7 @@ class BinaryInst(MSP430Instruction):
         if result != None:
             self.destination.set(cpu, result)
         self._set_flags(cpu, flags, result, dst())
-        if not (isinstance(self.destination, RegisterOperand) and self.destination.reg == 0):
+        if not (isinstance(self.destination, RegisterOperand) and self.destination.reg == 0 and result != None):
             #Only advance program counter if it hasn't been modified by the instruction
             super().eval(cpu)
         
@@ -384,6 +413,18 @@ class AndInst(BinaryInst):
         cpu.set_flag(CPUFlags.C, result != 0)
         return (result, "NZ")
         
+class XorInst(BinaryInst):
+    def __init__(self, source, dest, size):
+        self.mnem = "xor"
+        super().__init__(source, dest, size)
+        
+    def _eval(self, cpu, src, dst):
+        result = src() ^ dst()
+        msb = 0x80 if self.size == 1 else 0x8000
+        cpu.set_flag(CPUFlags.V, False)
+        cpu.set_flag(CPUFlags.C, result != 0)
+        return (result, "NZ")
+        
 class BisInst(BinaryInst):
     def __init__(self, source, dest, size):
         self.mnem = "bis"
@@ -392,14 +433,22 @@ class BisInst(BinaryInst):
     def _eval(self, cpu, src, dst):
         return (src() | dst(), "")
         
+class BicInst(BinaryInst):
+    def __init__(self, source, dest, size):
+        self.mnem = "bic"
+        super().__init__(source, dest, size)
+        
+    def _eval(self, cpu, src, dst):
+        return (~src() & dst(), "")
+        
 class CmpInst(BinaryInst):
     def __init__(self, source, dest, size):
         self.mnem = "cmp"
         super().__init__(source, dest, size)
         
     def _eval(self, cpu, src, dst):
-        result = dst() - src()
-        self._set_flags(cpu, "CVNZ", (~src() & (0xff if self.size == 1 else 0xffff)) + 1 + dst(), dst())
+        result = (~src() & (0xff if self.size == 1 else 0xffff)) + 1 + dst()
+        self._set_flags(cpu, "CVNZ", result, dst())
         return (None, "")
         
 class SubInst(BinaryInst):
@@ -423,9 +472,36 @@ class DaddInst(BinaryInst):
         self.mnem = "dadd"
         super().__init__(source, dest, size)
         
-    def _eval(self, cpu, src, dst):
-        raise RuntimeError("not implemented")
-        return (src() + dst(), "CVNZ")
+    def eval(self, cpu):
+        src = self.source.get(cpu)
+        dst = self.destination.get(cpu)
+        print("dadd %04x, %04x" % (src, dst))
+        msb = 0x80 if self.size == 1 else 0x8000
+        max_val = 99 if self.size == 1 else 9999
+        
+        result = 0
+        n = 0
+        carry = 0 #1 if cpu.get_flag(CPUFlags.C) else 0
+        for digit in range(self.size * 2):
+            a = (src >> (digit * 4)) & 0xf
+            b = (dst >> (digit * 4)) & 0xf
+            
+            tmp = a + b + carry
+            n = tmp & 0x8 != 0
+            if tmp > 9:
+                tmp -= 10
+                carry = 1
+            else:
+                carry = 0
+            result = result | ((tmp & 0xf) << (digit * 4))
+
+        self.destination.set(cpu, result)
+        cpu.set_flag(CPUFlags.N, cpu.get_flag(CPUFlags.N) or (result & msb != 0))
+        #cpu.set_flag(CPUFlags.C, carry != 0)
+        cpu.set_flag(CPUFlags.C, carry != 0)
+        cpu.set_flag(CPUFlags.Z, result == 0)
+        cpu.set_flag(CPUFlags.V, 0)
+        MSP430Instruction.eval(self, cpu)
 
 class Memory():
     def __init__(self):
@@ -438,6 +514,8 @@ class Memory():
         }[size]
 
     def write(self, address, size, val):
+        if address == 0x43fc:
+            print("Address has been written to")
         if size == 1:
             self.data[address & 0xffff] = val & 0xff
         elif size == 2:
@@ -475,6 +553,7 @@ class MSP430Cpu():
             
     def _handle_callgate(self):
         gate_num = (self.get_sr() >> 8) & 0x7f
+        print("Invoking callgate 0x%x" % gate_num)
         if gate_num == 0:
             char = self.memory.read(self.get_sp() + 8, 2)
             sys.stdout.write(chr(char))
@@ -484,18 +563,12 @@ class MSP430Cpu():
             buf_addr = self.memory.read(self.get_sp() + 8, 2)
             buf_size = self.memory.read(self.get_sp() + 10, 2)
             
-            sys.stderr.write("INPUT> ")
-            sys.stderr.flush()
+            print("Writing input '%s' to 0x%x (max len 0x%x)" % ("".join([chr(x) for x in self.input]), buf_addr, buf_size))
             
-            line = sys.stdin.readline().strip()
-            if line.startswith(":"):
-                data = [int("".join(x), 16) for x in zip(*[iter(line[1:])] * 2)]
-            else:
-                data = [ord(x) for x in line]
-            for (byte, i) in zip(data, range(buf_size)):
+            for (byte, i) in zip(self.input, range(buf_size)):
                 self.memory.write(buf_addr + i, 1, byte)
         elif gate_num == 0x20:
-            self.set_register(15, self.rand.pop())
+            self.set_register(15, 0)
         elif gate_num == 0x7f:
             sys.stderr.write("Deadbolt unlocked. You're done.")
             sys.exit(0)
@@ -513,6 +586,7 @@ class MSP430Cpu():
             return {
                 0: RegisterOperand(reg, size),
                 1: RegisterOffsetOperand(reg, self.memory.read(address, 2), size),
+                2: PcIndirectOperand(size),
                 3: ImmediateOperand(self.memory.read(address, size), size)}[As]
             assert(False)
         elif reg == 2:
@@ -556,7 +630,6 @@ class MSP430Cpu():
         # see http://www.ece.utep.edu/courses/web3376/Links_files/MSP430%20Quick%20Reference.pdf
         # and http://www.ti.com/lit/ug/slau144j/slau144j.pdf
         opcode = self.memory.read(address, 2)
-        print("opcode = %04x" % opcode)
         if opcode & 0xe000 == 0x2000:
             return JumpInst((sext(opcode & 0x3ff, 10) * 2 + 2) & 0xffff, Condition((opcode >> 10) & 7))
         elif opcode & 0xfc00 == 0x1000:
@@ -574,6 +647,7 @@ class MSP430Cpu():
                     0x0: RRCInst,
                     0x1: SwpbInst,
                     0x2: RRAInst,
+                    0x3: SXTInst,
                     0x4: PushInst,
                     0x5: CallInst,
                 }[opc](op, size)
@@ -595,7 +669,9 @@ class MSP430Cpu():
                 0x8: SubInst,
                 0x9: CmpInst,
                 0xa: DaddInst,
+                0xc: BicInst,
                 0xd: BisInst,
+                0xe: XorInst,
                 0xf: AndInst
             }[opc](src_op, dst_op, size)
             
@@ -681,6 +757,11 @@ def main(args, env):
     memory = Memory()
     cpu = MSP430Cpu(memory)
     
+    if args.hex:
+        cpu.input = [int("".join(x), 16) for x in zip(*[iter(args.input)] * 2)]
+    else:
+        cpu.input = [ord(x) for x in args.input]
+        
     load_srec(args.image, memory, cpu)
     
     if args.restore:
@@ -735,20 +816,21 @@ def main(args, env):
                             print("Memory in trace:")
                             print("%04x: %s" % (addr, " ".join(["%02x" % x for x in bytes])))
                             raise RuntimeError("Mismatch between memory contents at address 0x%04x in tracefile line %d" % (addr + i, linenum))
-                print("CPU:")
-                print(str(cpu))
-                print("Trace:")
-                print(("pc  %04x    sp  %04x    sr  %04x    cg  %04x\n" + \
-                     "r4  %04x    r5  %04x    r6  %04x    r7  %04x\n" + \
-                     "r8  %04x    r9  %04x    r10 %04x    r11 %04x\n" + \
-                     "r12 %04x    r13 %04x    r14 %04x    r15 %04x\n") \
-                     % (data["regs"][0], data["regs"][1], data["regs"][2], 
-                        data["regs"][3], data["regs"][4], data["regs"][5],
-                        data["regs"][6], data["regs"][7], data["regs"][8],
-                        data["regs"][9], data["regs"][10], data["regs"][11],
-                        data["regs"][12], data["regs"][13], data["regs"][14], 
-                        data["regs"][15]))
+#                print("CPU:")
+#                print(str(cpu))
+#                print("Trace:")
+#                print(("pc  %04x    sp  %04x    sr  %04x    cg  %04x\n" + \
+#                     "r4  %04x    r5  %04x    r6  %04x    r7  %04x\n" + \
+#                     "r8  %04x    r9  %04x    r10 %04x    r11 %04x\n" + \
+#                     "r12 %04x    r13 %04x    r14 %04x    r15 %04x\n") \
+#                     % (data["regs"][0], data["regs"][1], data["regs"][2], 
+#                        data["regs"][3], data["regs"][4], data["regs"][5],
+#                        data["regs"][6], data["regs"][7], data["regs"][8],
+#                        data["regs"][9], data["regs"][10], data["regs"][11],
+#                        data["regs"][12], data["regs"][13], data["regs"][14], 
+#                        data["regs"][15]))
                 cpu.step(True)
+#                cpu.step()
                 lastinst = data["insn"]
                 linenum += 1
     else:
@@ -761,6 +843,9 @@ def parse_args():
     parser.add_argument("image", type = str, default = None, help = "Program image as SREC file")
     parser.add_argument("--verify", type = str, default = None, help = "Verify execution against given web trace")
     parser.add_argument("--restore", type = str, default = None, help = "Restore system snapshot from JSON file")
+    input_group = parser.add_argument_group("input")
+    input_group.add_argument("--input", type = str, default = "", help = "Input to provide to the lock")
+    input_group.add_argument("--hex", action = "store_true", default = False, help = "Input is hex-encoded")
     args = parser.parse_args()
 
     return args
