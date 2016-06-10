@@ -207,6 +207,9 @@ class CpuStateStruct(cty.Structure):
         elif size == 2:
             self.memory[address] = value & 0xff
             self.memory[address + 1] = (value >> 8) & 0xff
+            
+    def is_cpuoff(self):
+        return self.registers[2] & (1 << CPUFlags.CPUOFF.value) != 0
 
 def sext(val, bits):
     """Extend a value with @bits bits to a signed 16 bit value"""
@@ -1255,17 +1258,21 @@ class MSP430Cpu():
             
             src_op = self._decode_source(address + 2, As, src, size)
             dst_op = self._decode_destination(address + 2 + src_op.len, Ad, dst, size)
-            return {
-                0x4: MovInst,
-                0x5: AddInst,
-                0x8: SubInst,
-                0x9: CmpInst,
-                0xa: DaddInst,
-                0xc: BicInst,
-                0xd: BisInst,
-                0xe: XorInst,
-                0xf: AndInst
-            }[opc](src_op, dst_op, size)
+            try:
+                return {
+                    0x4: MovInst,
+                    0x5: AddInst,
+                    0x8: SubInst,
+                    0x9: CmpInst,
+                    0xa: DaddInst,
+                    0xc: BicInst,
+                    0xd: BisInst,
+                    0xe: XorInst,
+                    0xf: AndInst
+                }[opc](src_op, dst_op, size)
+            except KeyError:
+                print("Unknown assembler instruction 0x%04x at address 0x%04x" % (opcode, address))
+                sys.exit(1)
         
     def _parse_srec_line(self, line):
         type = line[:2]
@@ -1398,7 +1405,10 @@ def main(args, env):
 #                        data["regs"][12], data["regs"][13], data["regs"][14], 
 #                        data["regs"][15]))
                 # cpu.step(True)
+                print(linenum)
                 cpu.step(True)
+                if cpu.state.is_cpuoff():
+                    sys.exit(0)
                 lastinst = data["insn"]
                 linenum += 1
     else:
