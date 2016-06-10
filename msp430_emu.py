@@ -53,11 +53,11 @@ class TranslationBlock(object):
         if reg == 2:
             gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_register_gep_indices(2), True, "ptr_r2")
             r2 = self.builder.load(gep, "r2")
-            r2 = self.builder.and_(r2, Constant(IntType(16), ~0x0107), "r2_without_flags")
+            r2 = self.builder.and_(r2, llir.Constant(llir.IntType(16), ~0x0107), "r2_without_flags")
             for flag in (CPUFlags.C, CPUFlags.Z, CPUFlags.N, CPUFlags.V):
                 gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_flag_gep_indices(flag), True, "ptr_flag_%s" % (flag.name, ))
                 flag_val = self.builder.load(gep, "flag_%s_i16" % (flag.name, ))
-                flag_val = self.builder.shl(flag_val, Constant(IntType(16), flag.value), "flag_%s_shifted" % (flag.name, ))
+                flag_val = self.builder.shl(flag_val, llir.Constant(llir.IntType(16), flag.value), "flag_%s_shifted" % (flag.name, ))
                 r2 = self.builder.or_(r2, flag_val, "r2")
             return r2
         else:
@@ -71,8 +71,8 @@ class TranslationBlock(object):
             self.builder.store(r2_no_flags, gep)
             for flag in (CPUFlags.C, CPUFlags.Z, CPUFlags.N, CPUFlags.V):
                 gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_flag_gep_indices(flag), True, "ptr_flag_%s" % (flag.name, ))
-                flag_val = self.builder.lshr(value, Constant(IntType(INT_BITS), flag.value), "flag_%s_i16_unfiltered" % (flag.name, ))
-                flag_val = self.builder.and_(flag_val, Constant(IntType(INT_BITS), 1), "flag_%s_i16" % (flag.name, ))
+                flag_val = self.builder.lshr(value, llir.Constant(llir.IntType(INT_BITS), flag.value), "flag_%s_i16_unfiltered" % (flag.name, ))
+                flag_val = self.builder.and_(flag_val, llir.Constant(llir.IntType(INT_BITS), 1), "flag_%s_i16" % (flag.name, ))
                 self.builder.store(flag_val, gep)
         else:
             gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_register_gep_indices(reg), True, "ptr_r%d" % (reg, ))
@@ -951,22 +951,27 @@ class MSP430Cpu():
         self.state.write_memory(0x10, 2, 0x4130)
         self.state.set_register(0, 0x4400)
         self.translation_context = TranslationContext()
+        self.translation_buffer = {}
         
     def step(self, verbose = False):
-        tb = self.translate_block(single_instruction = True)
+        address = self.state.get_register(0)
+        if address in self.translation_buffer:
+            tb = self.translation_buffer[address]
+        else:
+            tb = self.translate_block(address, single_instruction = True)
 #        print(str(self.translation_context.module))
        
-        print(str(tb.module))
-        tb.compiled_module = llvm.parse_assembly(str(tb.module))
-        tb.target_machine = llvm.Target.from_default_triple().create_target_machine()
-        with llvm.create_mcjit_compiler(tb.compiled_module, tb.target_machine) as ee:
-
-            ee.finalize_object()
-            tb.native = cty.CFUNCTYPE(None, cty.POINTER(CpuStateStruct))(ee.get_pointer_to_function(tb.compiled_module.get_function(tb.function.name)))
-            
+            #print(str(tb.module))
+            tb.compiled_module = llvm.parse_assembly(str(tb.module))
+            tb.target_machine = llvm.Target.from_default_triple().create_target_machine()
+            tb.execution_engine = llvm.create_mcjit_compiler(tb.compiled_module, tb.target_machine)
+            tb.execution_engine.finalize_object()
+            tb.native = cty.CFUNCTYPE(None, cty.POINTER(CpuStateStruct))(tb.execution_engine.get_pointer_to_function(tb.compiled_module.get_function(tb.function.name)))
+            self.translation_buffer[address] = tb
 #            print("Before:")
 #            print(str(self))
-            tb.native(self.state)
+        assert(tb.native is not None)
+        tb.native(self.state)
 #            print("After:")
 #            print(str(self))
         
@@ -981,7 +986,7 @@ class MSP430Cpu():
         #         print("%04x: %s" % (self.get_pc(), str(inst)))
         #     inst.eval(self)
             
-    def translate_block(self, single_instruction = False):
+    def translate_block(self, address, single_instruction = False):
         address = self.state.get_register(0)
 #        assert(not (address in self.translation_context.translation_blocks))
         
