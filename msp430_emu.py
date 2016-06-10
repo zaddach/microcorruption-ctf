@@ -27,6 +27,7 @@ class TranslationBlock(object):
     def __init__(self, context, address):
         self.context = context
         self.address = address
+        self.instructions = []
         self.module = llir.Module("tb_0x%04x_%d" % (address, context.counter))
 #        self.module.data_layout = DATA_LAYOUT_STRING
 #        self.module.triple = TRIPLE
@@ -49,6 +50,12 @@ class TranslationBlock(object):
         value = self.builder.zext(value, llir.IntType(INT_BITS), "flag_%s_i16" % (flag.name, ))
         self.builder.store(value, gep)
         
+        #high bits are cleared
+        gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_register_gep_indices(2), True, "ptr_r2")
+        r2 = self.builder.load(gep, "r2")
+        r2_no_callgate = self.builder.and_(r2, llir.Constant(llir.IntType(16), ~0xfe00), "r2_without_flags")
+        self.builder.store(r2_no_callgate, gep)
+        
     def get_register(self, reg):
         if reg == 2:
             gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_register_gep_indices(2), True, "ptr_r2")
@@ -66,8 +73,8 @@ class TranslationBlock(object):
         
     def set_register(self, reg, value):
         if reg == 2:
-            gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_reg_gep_indices(2), True, "ptr_r2")
-            r2_no_flags = self.builder.and_(value, Constant(IntType(16), ~0x0107), "r2_without_flags")
+            gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_register_gep_indices(2), True, "ptr_r2")
+            r2_no_flags = self.builder.and_(value, llir.Constant(llir.IntType(16), ~0x0107), "r2_without_flags")
             self.builder.store(r2_no_flags, gep)
             for flag in (CPUFlags.C, CPUFlags.Z, CPUFlags.N, CPUFlags.V):
                 gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_flag_gep_indices(flag), True, "ptr_flag_%s" % (flag.name, ))
@@ -161,19 +168,19 @@ class CpuStateStruct(cty.Structure):
     def get_register(self, reg):
         if reg == 2:
             return (self.registers[2] & ~0x0107) | \
-                (self.C << CPUFlags.C) | \
-                (self.Z << CPUFlags.Z) | \
-                (self.N << CPUFlags.N) | \
-                (self.V << CPUFlags.V)
+                (self.C << CPUFlags.C.value) | \
+                (self.Z << CPUFlags.Z.value) | \
+                (self.N << CPUFlags.N.value) | \
+                (self.V << CPUFlags.V.value)
         else:
             return self.registers[reg]
             
     def set_register(self, reg, val):
         if reg == 2:
-            self.C = (val >> CPUFlags.C) & 1
-            self.Z = (val >> CPUFlags.Z) & 1
-            self.N = (val >> CPUFlags.N) & 1
-            self.V = (val >> CPUFlags.V) & 1
+            self.C = (val >> CPUFlags.C.value) & 1
+            self.Z = (val >> CPUFlags.Z.value) & 1
+            self.N = (val >> CPUFlags.N.value) & 1
+            self.V = (val >> CPUFlags.V.value) & 1
             self.registers[2] = val & ~0x0107
         else:
             self.registers[reg] = val
@@ -519,10 +526,10 @@ class PcIndirectOperand(Operand):
     def get(self, cpu):
         return cpu.memory.read(cpu.get_register(0) + 2, self.size)
         
-    def get_llvm(self, tb):
+    def get_llvm_value(self, tb):
         addr = tb.get_register(0)
         addr = tb.builder.inttoptr(addr, llir.PointerType(llir.IntType(self.size * 8)))
-        return tb.builder.load(addr)
+        return tb.read_memory(addr)
         
     def __str__(self):
         return "@%s" % (self._regname(0), )
@@ -593,6 +600,21 @@ class RRAInst(UnaryInst):
         self.op.set(cpu, result)
         super().eval(cpu)
         
+    def generate_llvm(self, tb):
+        self._advance_pc(tb)
+        c = tb.get_flag(CPUFlags.C)
+        old_c = tb.builder.zext(c, llir.IntType(self.size * 8))
+        old_c = tb.builder.shl(old_c, llir.Constant(old_c.type, self.size * 8 - 1))
+        val = self.op.get_llvm_value(tb)
+        msb = tb.builder.and_(val, llir.Constant(val.type, 1 << (val.type.width - 1)))
+        result = tb.builder.lshr(val, llir.Constant(val.type, 1))
+        result = tb.builder.or_(result, msb)
+        self.op.set_llvm_value(tb, result)
+        tb.set_flag(CPUFlags.V, llir.Constant(llir.IntType(1), 0))
+        tb.set_flag(CPUFlags.N, tb.builder.or_(tb.get_flag(CPUFlags.N), tb.builder.icmp_unsigned("!=", msb, llir.Constant(msb.type, 0))))
+        tb.set_flag(CPUFlags.Z, llir.Constant(llir.IntType(1), 0))
+        
+        
 class RRCInst(UnaryInst):
     def __init__(self, op, size):
         self.mnem = "rrc"
@@ -611,6 +633,20 @@ class RRCInst(UnaryInst):
         cpu.set_flag(CPUFlags.V, False)
         self.op.set(cpu, result)
         super().eval(cpu)
+        
+    def generate_llvm(self, tb):
+        self._advance_pc(tb)
+        c = tb.get_flag(CPUFlags.C)
+        old_c = tb.builder.zext(c, llir.IntType(self.size * 8))
+        old_c = tb.builder.shl(old_c, llir.Constant(old_c.type, self.size * 8 - 1))
+        val = self.op.get_llvm_value(tb)
+        result = tb.builder.lshr(val, llir.Constant(val.type, 1))
+        result = tb.builder.or_(result, old_c)
+        self.op.set_llvm_value(tb, result)
+        tb.set_flag(CPUFlags.C, tb.builder.trunc(val, llir.IntType(1)))
+        tb.set_flag(CPUFlags.V, llir.Constant(llir.IntType(1), 0))
+        tb.set_flag(CPUFlags.N, tb.builder.or_(tb.get_flag(CPUFlags.N), c))
+        tb.set_flag(CPUFlags.Z, tb.builder.and_(tb.get_flag(CPUFlags.Z), tb.builder.icmp_unsigned("==", result, llir.Constant(result.type, 0))))
         
 class SXTInst(UnaryInst):
     def __init__(self, op, size):
@@ -638,10 +674,12 @@ class PushInst(UnaryInst):
         super().eval(cpu)
         
     def generate_llvm(self, tb):
+        self._advance_pc(tb)
         sp = tb.get_register(1)
         sp = tb.builder.sub(sp, llir.Constant(sp.type, 2))
         tb.set_register(1, sp)
         tb.write_memory(tb.builder.inttoptr(sp, llir.PointerType(llir.IntType(16))), self.op.get_llvm_value(tb))
+        
         
 class CallInst(UnaryInst):
     def __init__(self, op, size):
@@ -653,6 +691,16 @@ class CallInst(UnaryInst):
         cpu.memory.write(cpu.get_sp(), self.size, cpu.get_pc() + self.len)
         cpu.set_pc(self.op.get(cpu))
         
+    def generate_llvm(self, tb):
+        sp = tb.get_register(1)
+        sp = tb.builder.sub(sp, llir.Constant(sp.type, 2))
+        tb.set_register(1, sp)
+        address = tb.builder.inttoptr(sp, llir.PointerType(llir.IntType(16)))
+        pc = tb.get_register(0)
+        next_pc = tb.builder.add(pc, llir.Constant(pc.type, self.len))
+        tb.write_memory(address, next_pc)
+        tb.set_register(0, self.op.get_llvm_value(tb))
+        
 class SwpbInst(UnaryInst):
     def __init__(self, op, size):
         self.mnem = "swpb"
@@ -662,7 +710,15 @@ class SwpbInst(UnaryInst):
         val = self.op.get(cpu)
         self.op.set(cpu, (val >> 8) | ((val & 0xff) << 8))
         super().eval(cpu)
-      
+        
+    def generate_llvm(self, tb):
+        self._advance_pc(tb)
+        val = self.op.get_llvm_value(tb)
+        hi = tb.builder.lshr(val, llir.Constant(val.type, 8))
+        lo = tb.builder.and_(val, llir.Constant(val.type, 0xff))
+        new_val = tb.builder.shl(lo, llir.Constant(lo.type, 8))
+        new_val = tb.builder.or_(new_val, hi)
+        self.op.set_llvm_value(tb, new_val)
         
 class BinaryInst(MSP430Instruction):
     def __init__(self, source, destination, size):
@@ -710,13 +766,14 @@ class BinaryInst(MSP430Instruction):
         if 'C' in flags:
             tb.set_flag(CPUFlags.C, carry)
         if 'V' in flags:
-            dst_N = tb.builder.icmp_unsigned("!=", 
-                tb.builder.and_(dst, llir.Constant(dst.type, 1 << (dst.type.width - 1))),
-                llir.Constant(dst.type, 0))
-            res_N = tb.builder.icmp_unsigned("!=", 
-                tb.builder.and_(result, llir.Constant(result.type, 1 << (result.type.width - 1))),
-                llir.Constant(dst.type, 0))
-            tb.set_flag(CPUFlags.V, tb.builder.xor(dst_N, res_N))
+            tb.set_flag(CPUFlags.V, llir.Constant(llir.IntType(1), 0))
+#            dst_N = tb.builder.icmp_unsigned("!=", 
+#                tb.builder.and_(dst, llir.Constant(dst.type, 1 << (dst.type.width - 1))),
+#                llir.Constant(dst.type, 0))
+#            res_N = tb.builder.icmp_unsigned("!=", 
+#                tb.builder.and_(result, llir.Constant(result.type, 1 << (result.type.width - 1))),
+#                llir.Constant(dst.type, 0))
+#            tb.set_flag(CPUFlags.V, tb.builder.xor(dst_N, res_N))
         if 'N' in flags:
             res_N = tb.builder.icmp_unsigned("!=", 
                 tb.builder.and_(result, llir.Constant(result.type, 1 << (result.type.width - 1))),
@@ -769,6 +826,11 @@ class XorInst(BinaryInst):
         cpu.set_flag(CPUFlags.V, False)
         cpu.set_flag(CPUFlags.C, result != 0)
         return (result, "NZ")
+    
+    def _generate_llvm(self, tb, src, dst):
+        result = tb.builder.xor(src(), dst())
+        self._set_logical_flags(tb, "CVNZ", result)
+        return result
         
 class BisInst(BinaryInst):
     def __init__(self, source, dest, size):
@@ -910,8 +972,76 @@ class DaddInst(BinaryInst):
         cpu.set_flag(CPUFlags.V, 0)
         MSP430Instruction.eval(self, cpu)
         
-    def _generate_llvm(self, tb, src, dst):
-        assert(False)
+    def generate_llvm(self, tb):
+        self._advance_pc(tb)
+        src = self.source.get_llvm_value(tb)
+        dst = self.destination.get_llvm_value(tb)
+        typ = llir.IntType(self.size * 8)
+        bitpos = llir.Constant(typ, 0)
+        carry = llir.Constant(llir.IntType(1), 0)
+        n = llir.Constant(llir.IntType(1), 0)
+        result = llir.Constant(src.type, 0)
+        
+        bb_cond = tb.function.append_basic_block("dadd_condition")
+        tb.builder.branch(bb_cond)
+        bb_body = tb.function.append_basic_block("dadd_loop_body")
+        bb_after = tb.function.append_basic_block("dadd_after_loop")
+        builder_cond = llir.IRBuilder(bb_cond)
+        bitpos_phi = builder_cond.phi(bitpos.type, "bitpos")
+        bitpos_phi.add_incoming(bitpos, tb.builder.block)
+        carry_phi = builder_cond.phi(carry.type, "carry")
+        carry_phi.add_incoming(carry, tb.builder.block)
+        n_phi = builder_cond.phi(n.type, "n")
+        n_phi.add_incoming(n, tb.builder.block)
+        result_phi = builder_cond.phi(result.type, "result")
+        result_phi.add_incoming(result, tb.builder.block)
+        exit_cond = builder_cond.icmp_unsigned(">=", bitpos_phi, llir.Constant(bitpos_phi.type, self.size * 8), "exit_cond")
+        builder_cond.cbranch(exit_cond, bb_after, bb_body)
+        
+        builder_body = llir.IRBuilder(bb_body)
+        a = builder_body.and_(builder_body.lshr(src, bitpos_phi), llir.Constant(src.type, 0xf))
+        b = builder_body.and_(builder_body.lshr(dst, bitpos_phi), llir.Constant(src.type, 0xf))
+        
+        tmp = builder_body.add(a, b)
+        tmp = builder_body.add(tmp, builder_body.zext(carry_phi, tmp.type))
+        n = builder_body.icmp_unsigned("!=", builder_body.and_(tmp, llir.Constant(tmp.type, 0x8)), llir.Constant(tmp.type, 0))
+        v = builder_body.icmp_unsigned(">", tmp, llir.Constant(tmp.type, 9))
+        bb_overflow = tb.function.append_basic_block("overflow")
+        bb_body2 = tb.function.append_basic_block("dadd_loop_body_2")
+        carry_1 = llir.Constant(llir.IntType(1), 0)
+        builder_body.cbranch(v, bb_overflow, bb_body2)
+        builder_v = llir.IRBuilder(bb_overflow)
+        tmp_2 = builder_v.sub(tmp, llir.Constant(tmp.type, 10))
+        carry_2 = llir.Constant(llir.IntType(1), 1)
+        builder_v.branch(bb_body2)
+        
+        builder_body2 = llir.IRBuilder(bb_body2)
+        carry_phi2 = builder_body2.phi(carry_1.type, "carry")
+        carry_phi2.add_incoming(carry_1, bb_body)
+        carry_phi2.add_incoming(carry_2, bb_overflow)
+        carry_phi.add_incoming(carry_phi2, bb_body2)
+        n_phi.add_incoming(n, bb_body2)
+        tmp_phi = builder_body2.phi(tmp.type, "tmp")
+        tmp_phi.add_incoming(tmp, bb_body)
+        tmp_phi.add_incoming(tmp_2, bb_overflow)
+        tmp_phi = builder_body2.and_(tmp_phi, llir.Constant(tmp_phi.type, 0xf))
+        tmp_phi = builder_body2.shl(tmp_phi, bitpos_phi)
+        result = builder_body2.or_(result_phi, tmp_phi)
+        result_phi.add_incoming(result, bb_body2)
+        bitpos = builder_body2.add(bitpos_phi, llir.Constant(bitpos_phi.type, 4))
+        bitpos_phi.add_incoming(bitpos, bb_body2)
+        builder_body2.branch(bb_cond)
+        
+        tb.builder = llir.IRBuilder(bb_after)
+        self.destination.set_llvm_value(tb, result_phi)
+        n = tb.builder.or_(tb.get_flag(CPUFlags.N), tb.builder.trunc(tb.builder.lshr(result, llir.Constant(result.type, result.type.width - 1)), llir.IntType(1)))
+        tb.set_flag(CPUFlags.N, n)
+        tb.set_flag(CPUFlags.C, carry_phi)
+        tb.set_flag(CPUFlags.Z, tb.builder.icmp_unsigned("==", result, llir.Constant(result.type, 0)))
+        tb.set_flag(CPUFlags.V, llir.Constant(llir.IntType(1), 0))
+        tb.builder.ret_void()
+        
+        print(tb.function)
 
 class Memory():
     def __init__(self):
@@ -955,23 +1085,28 @@ class MSP430Cpu():
         
     def step(self, verbose = False):
         address = self.state.get_register(0)
-        if address in self.translation_buffer:
-            tb = self.translation_buffer[address]
+        if address == 0x0010 and self.state.get_register(2) & 0x8000 != 0:
+            self._handle_callgate()
         else:
-            tb = self.translate_block(address, single_instruction = True)
-#        print(str(self.translation_context.module))
-       
-            #print(str(tb.module))
-            tb.compiled_module = llvm.parse_assembly(str(tb.module))
-            tb.target_machine = llvm.Target.from_default_triple().create_target_machine()
-            tb.execution_engine = llvm.create_mcjit_compiler(tb.compiled_module, tb.target_machine)
-            tb.execution_engine.finalize_object()
-            tb.native = cty.CFUNCTYPE(None, cty.POINTER(CpuStateStruct))(tb.execution_engine.get_pointer_to_function(tb.compiled_module.get_function(tb.function.name)))
-            self.translation_buffer[address] = tb
-#            print("Before:")
-#            print(str(self))
-        assert(tb.native is not None)
-        tb.native(self.state)
+            if address in self.translation_buffer:
+                tb = self.translation_buffer[address]
+            else:
+                tb = self.translate_block(address, single_instruction = True)
+        #        print(str(self.translation_context.module))
+   
+                #print(str(tb.module))
+                tb.compiled_module = llvm.parse_assembly(str(tb.module))
+                tb.target_machine = llvm.Target.from_default_triple().create_target_machine()
+                tb.execution_engine = llvm.create_mcjit_compiler(tb.compiled_module, tb.target_machine)
+                tb.execution_engine.finalize_object()
+                tb.native = cty.CFUNCTYPE(None, cty.POINTER(CpuStateStruct))(tb.execution_engine.get_pointer_to_function(tb.compiled_module.get_function(tb.function.name)))
+                self.translation_buffer[address] = tb
+        #            print("Before:")
+        #            print(str(self))
+            assert(tb.native is not None)
+            if verbose:
+                print(tb.instructions[0])
+            tb.native(self.state)
 #            print("After:")
 #            print(str(self))
         
@@ -995,7 +1130,7 @@ class MSP430Cpu():
         translate_next_instruction = True
         while translate_next_instruction:
             inst = self.decode_instruction(address)
-            print(inst)
+            tb.instructions.append(inst)
             translate_next_instruction = inst.generate_llvm(tb)
             if single_instruction and translate_next_instruction:
                 break
@@ -1007,23 +1142,24 @@ class MSP430Cpu():
         
             
     def _handle_callgate(self):
-        gate_num = (self.get_sr() >> 8) & 0x7f
+        gate_num = (self.state.get_register(2) >> 8) & 0x7f
         print("Invoking callgate 0x%x" % gate_num)
         if gate_num == 0:
-            char = self.memory.read(self.get_sp() + 8, 2)
+            char = self.state.read_memory(self.state.get_register(1) + 8, 2)
             sys.stdout.write(chr(char))
         elif gate_num == 1:
-            self.set_register(15, ord(sys.stdin.read(1)))
+            self.state.set_register(15, ord(sys.stdin.read(1)))
         elif gate_num == 2:
-            buf_addr = self.memory.read(self.get_sp() + 8, 2)
-            buf_size = self.memory.read(self.get_sp() + 10, 2)
+            buf_addr = self.state.read_memory(self.state.get_register(1) + 8, 2)
+            buf_size = self.state.read_memory(self.state.get_register(1) + 10, 2)
             
             print("Writing input '%s' to 0x%x (max len 0x%x)" % ("".join([chr(x) for x in self.input]), buf_addr, buf_size))
             
             for (byte, i) in zip(self.input, range(buf_size)):
-                self.memory.write(buf_addr + i, 1, byte)
+                self.state.write_memory(buf_addr + i, 1, byte)
         elif gate_num == 0x20:
-            self.set_register(15, 0)
+            print("Generating random number")
+            self.state.set_register(15, 0)
         elif gate_num == 0x7f:
             sys.stderr.write("Deadbolt unlocked. You're done.")
             sys.exit(0)
@@ -1031,8 +1167,9 @@ class MSP430Cpu():
             print("Unhandled callgate code: 0x%02x" % gate_num)
             assert(False)
         
-        self.set_pc(self.memory.read(self.get_sp(), 2))
-        self.set_sp(self.get_sp() + 2)
+        self.state.set_register(0, self.state.read_memory(self.state.get_register(1), 2))
+        self.state.set_register(1, self.state.get_register(1) + 2)
+        #self.state.set_register(2, self.state.get_register(2) & 0xff)
                 
             
         
@@ -1261,7 +1398,7 @@ def main(args, env):
 #                        data["regs"][12], data["regs"][13], data["regs"][14], 
 #                        data["regs"][15]))
                 # cpu.step(True)
-                cpu.step()
+                cpu.step(True)
                 lastinst = data["insn"]
                 linenum += 1
     else:
