@@ -14,6 +14,9 @@ import ctypes as cty
 INT_BITS = 16
 DATA_LAYOUT_STRING = "e-m:e-p:32:32-f64:32:64-f80:32-n8:16:32-S128"
 TRIPLE = "x86_64-apple-darwin15.4.0"
+
+#Ugly hack to circumvent garbage collector from freeing llvmlite objects (as this crashes the program)
+garbage = []
     
 class TranslationContext(object):
     def __init__(self):
@@ -110,7 +113,9 @@ class TranslationBlock(object):
             assert(False)
             
     def write_memory(self, address, value):
-        addr_val = self.builder.ptrtoint(address, llir.IntType(INT_BITS))
+        int32Ty = llir.IntType(32)
+        int16Ty = llir.IntType(16)
+        addr_val = self.builder.ptrtoint(address, int32Ty)
         assert(address.type.pointee == value.type)
         if address.type.pointee.width == 8:
             gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_memory_gep_indices(addr_val), True, "ptr_mem")
@@ -126,8 +131,20 @@ class TranslationBlock(object):
             
             self.builder.store(val_lo, gep_lo)
             self.builder.store(val_hi, gep_hi)
+            
+            #print_gep = self.builder.gep(self.function.args[0], [llir.Constant(llir.IntType(32), 0), llir.Constant(llir.IntType(32), 6)])
+            #print_func = self.builder.load(print_gep, "print_func")
+            #self.builder.call(print_func, [self.builder.trunc(addr_val, llir.IntType(16))])
+            #self.builder.call(print_func, [self.builder.zext(val_lo, llir.IntType(16))])
         else:
             assert(False)
+            
+        #Invalidate instruction cache 
+        invinst_gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_invalidate_instruction_cache_gep_indices(), "ptr_invalidate_instruction_cache")
+        invinst_func = self.builder.load(invinst_gep, "invalidate_instruction_cache")
+        self.builder.call(invinst_func, [self.builder.ptrtoint(address, int16Ty)])
+            
+INVALIDATE_INSTRUCTION_CACHE_FUNC = cty.CFUNCTYPE(None, cty.c_uint16)
         
 class CpuStateStruct(cty.Structure):
     
@@ -137,7 +154,8 @@ class CpuStateStruct(cty.Structure):
         ("Z", cty.c_uint16, llir.IntType(INT_BITS)),
         ("N", cty.c_uint16, llir.IntType(INT_BITS)),
         ("V", cty.c_uint16, llir.IntType(INT_BITS)),
-        ("memory", cty.c_uint8 * 0x10000, llir.ArrayType(llir.IntType(8), 0x10000))]
+        ("memory", cty.c_uint8 * 0x10000, llir.ArrayType(llir.IntType(8), 0x10000)),
+        ("invalidate_instruction_cache", INVALIDATE_INSTRUCTION_CACHE_FUNC, llir.PointerType(llir.FunctionType(llir.VoidType(), [llir.IntType(16)])))]
     
     _fields_ = [(name, ctype) for name, ctype, _ in fields]
         
@@ -164,6 +182,11 @@ class CpuStateStruct(cty.Structure):
         return (llir.Constant(llir.IntType(32), 0), 
                 llir.Constant(llir.IntType(32), 5), 
                 address)
+    
+    @classmethod
+    def get_invalidate_instruction_cache_gep_indices(clazz):
+        return (llir.Constant(llir.IntType(32), 0), 
+                llir.Constant(llir.IntType(32), 6))
         
     def get_register(self, reg):
         if reg == 2:
@@ -513,7 +536,7 @@ class RegisterIndirectOperand(Operand):
     def get(self, cpu):
         return cpu.memory.read(cpu.get_register(self.reg), self.size)
         
-    def get_llvm(self, tb):
+    def get_llvm_value(self, tb):
         reg = tb.get_register(self.reg)
         addr = tb.builder.inttoptr(reg, llir.PointerType(llir.IntType(self.size * 8)))
         return tb.builder.load(addr)
@@ -1043,8 +1066,6 @@ class DaddInst(BinaryInst):
         tb.set_flag(CPUFlags.Z, tb.builder.icmp_unsigned("==", result, llir.Constant(result.type, 0)))
         tb.set_flag(CPUFlags.V, llir.Constant(llir.IntType(1), 0))
         tb.builder.ret_void()
-        
-        print(tb.function)
 
 class Memory():
     def __init__(self):
@@ -1076,13 +1097,14 @@ class CPUFlags(Enum):
     CPUOFF = 4
 
 class MSP430Cpu():
-    def __init__(self, memory, startaddr = 0x4400):
+    def __init__(self, startaddr = 0x4400):
 #        self.memory = memory
 #        self.registers = [startaddr] + [0] * 15
 #        self.memory.write(0x10, 2, 0x4130)
         self.state = CpuStateStruct()
         self.state.write_memory(0x10, 2, 0x4130)
         self.state.set_register(0, 0x4400)
+        self.state.invalidate_instruction_cache = INVALIDATE_INSTRUCTION_CACHE_FUNC(self._invalidate_instruction_cache)
         self.translation_context = TranslationContext()
         self.translation_buffer = {}
         
@@ -1109,6 +1131,9 @@ class MSP430Cpu():
             assert(tb.native is not None)
             if verbose:
                 print(tb.instructions[0])
+                #print(str(self))
+#                print("%04x: %s" % (0xdff0, " ".join(["%02x%02x" % (x[1], x[0]) for x in zip(*[iter(self.state.memory[0xdff0:0xdff0+16])] * 2)])))
+#                print("%04x: %s" % (0xe000, " ".join(["%02x%02x" % (x[1], x[0]) for x in zip(*[iter(self.state.memory[0xe000:0xe000+16])] * 2)])))
             tb.native(self.state)
 #            print("After:")
 #            print(str(self))
@@ -1174,7 +1199,6 @@ class MSP430Cpu():
         self.state.set_register(1, self.state.get_register(1) + 2)
         #self.state.set_register(2, self.state.get_register(2) & 0xff)
                 
-            
         
     def _decode_source(self, address, As, reg, size):
         if reg == 0:
@@ -1295,6 +1319,15 @@ class MSP430Cpu():
                     self.state.set_register(0, data[1])
                 else:
                     raise RuntimeError("Unknown SREC record type: " + data[0])
+                    
+    def _invalidate_instruction_cache(self, address):
+        address = address & ~1
+        print("Invalidating instruction at %04x" % address)
+        if address in self.translation_buffer:
+            tb = self.translation_buffer[address]
+            del tb.execution_engine
+            del tb
+            del self.translation_buffer[address]
         
     def __str__(self):
         return ("pc  %04x    sp  %04x    sr  %04x    cg  %04x\n" + \
@@ -1323,15 +1356,21 @@ def registers_equal(x, y):
         (y[2] & (1 << CPUFlags.Z.value) != 0) == (x.state.Z != 0) and \
         (y[2] & (1 << CPUFlags.N.value) != 0) == (x.state.N != 0) and \
         (y[2] & (1 << CPUFlags.V.value) != 0) == (x.state.V != 0)
-        
+
+cpu = None        
+
+def print_val(val):
+    print("print_val: 0x%04x, mem[val] = 0x%04x" % (val, cpu.state.read_memory(val, 2)))
+    #print("%04x: %s" % (0xdff0, " ".join(["%02x%02x" % (x[1], x[0]) for x in zip(*[iter(cpu.state.memory[0xdff0:0xdff0+16])] * 2)])))
+    #print("%04x: %s" % (0xe000, " ".join(["%02x%02x" % (x[1], x[0]) for x in zip(*[iter(cpu.state.memory[0xe000:0xe000+16])] * 2)])))
 
 def main(args, env):
+    global cpu
     llvm.initialize()
     llvm.initialize_native_target()
     llvm.initialize_native_asmprinter()
-    memory = Memory()
-    cpu = MSP430Cpu(memory)
-    
+    cpu = MSP430Cpu()
+
     if args.hex:
         cpu.input = [int("".join(x), 16) for x in zip(*[iter(args.input)] * 2)]
     else:
@@ -1367,30 +1406,30 @@ def main(args, env):
                             data["regs"][15], "".join(x.name for x in (CPUFlags.C, CPUFlags.Z, CPUFlags.N, CPUFlags.V) if (data["regs"][2] & (1 << x.value)) != 0)))
                     raise RuntimeError("Mismatch between registers in tracefile line %d" % (linenum, ))
                 # for memline in ["".join(x) for x in zip(*[iter(data["updatememory"])] * 36)]:
-    #                 addr = int(memline[0:4], 16)
-    #                 bytes = [int("".join(x), 16) for x in zip(*[iter(memline[4:])] * 2)]
-    #                 for i in range(len(bytes)):
-    #                     if bytes[i] != memory.read(addr + i, 1):
-    #                         print("========================")
-    #                         print("Last instruction: %s" % lastinst)
-    #                         print("CPU registers:")
-    #                         print(str(cpu))
-    #                         print("Trace registers:")
-    #                         print(("pc  %04x    sp  %04x    sr  %04x    cg  %04x\n" + \
-    #                              "r4  %04x    r5  %04x    r6  %04x    r7  %04x\n" + \
-    #                              "r8  %04x    r9  %04x    r10 %04x    r11 %04x\n" + \
-    #                              "r12 %04x    r13 %04x    r14 %04x    r15 %04x\n") \
-    #                              % (data["regs"][0], data["regs"][1], data["regs"][2],
-    #                                 data["regs"][3], data["regs"][4], data["regs"][5],
-    #                                 data["regs"][6], data["regs"][7], data["regs"][8],
-    #                                 data["regs"][9], data["regs"][10], data["regs"][11],
-    #                                 data["regs"][12], data["regs"][13], data["regs"][14],
-    #                                 data["regs"][15]))
-    #                         print("Memory in emulator:")
-    #                         print("%04x: %s" % (addr, " ".join(["%02x" % memory.read(x, 1) for x in range(addr, addr + 16)])))
-    #                         print("Memory in trace:")
-    #                         print("%04x: %s" % (addr, " ".join(["%02x" % x for x in bytes])))
-    #                         raise RuntimeError("Mismatch between memory contents at address 0x%04x in tracefile line %d" % (addr + i, linenum))
+                #     addr = int(memline[0:4], 16)
+                #     bytes = [int("".join(x), 16) for x in zip(*[iter(memline[4:])] * 2)]
+                #     for i in range(len(bytes)):
+                #          if bytes[i] != cpu.state.read_memory(addr + i, 1):
+                #              print("========================")
+                #              print("Last instruction: %s" % lastinst)
+                #              print("CPU registers:")
+                #              print(str(cpu))
+                #              print("Trace registers:")
+                #              print(("pc  %04x    sp  %04x    sr  %04x    cg  %04x\n" + \
+                #                   "r4  %04x    r5  %04x    r6  %04x    r7  %04x\n" + \
+                #                   "r8  %04x    r9  %04x    r10 %04x    r11 %04x\n" + \
+                #                   "r12 %04x    r13 %04x    r14 %04x    r15 %04x\n") \
+                #                   % (data["regs"][0], data["regs"][1], data["regs"][2],
+                #                      data["regs"][3], data["regs"][4], data["regs"][5],
+                #                      data["regs"][6], data["regs"][7], data["regs"][8],
+                #                      data["regs"][9], data["regs"][10], data["regs"][11],
+                #                      data["regs"][12], data["regs"][13], data["regs"][14],
+                #                      data["regs"][15]))
+                #              print("Memory in emulator:")
+                #              print("%04x: %s" % (addr, " ".join(["%02x" % cpu.state.read_memory(x, 1) for x in range(addr, addr + 16)])))
+                #              print("Memory in trace:")
+                #              print("%04x: %s" % (addr, " ".join(["%02x" % x for x in bytes])))
+                #              raise RuntimeError("Mismatch between memory contents at address 0x%04x in tracefile line %d" % (addr + i, linenum))
 #                print("CPU:")
 #                print(str(cpu))
 #                print("Trace:")
@@ -1405,7 +1444,6 @@ def main(args, env):
 #                        data["regs"][12], data["regs"][13], data["regs"][14], 
 #                        data["regs"][15]))
                 # cpu.step(True)
-                print(linenum)
                 cpu.step(True)
                 if cpu.state.is_cpuoff():
                     sys.exit(0)
@@ -1413,7 +1451,6 @@ def main(args, env):
                 linenum += 1
     else:
         while True:
-            print(str(cpu))
             cpu.step(True)
 
 def parse_args():
