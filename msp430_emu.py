@@ -14,9 +14,6 @@ import ctypes as cty
 INT_BITS = 16
 DATA_LAYOUT_STRING = "e-m:e-p:32:32-f64:32:64-f80:32-n8:16:32-S128"
 TRIPLE = "x86_64-apple-darwin15.4.0"
-
-#Ugly hack to circumvent garbage collector from freeing llvmlite objects (as this crashes the program)
-garbage = []
     
 class TranslationContext(object):
     def __init__(self):
@@ -1321,13 +1318,8 @@ class MSP430Cpu():
                     raise RuntimeError("Unknown SREC record type: " + data[0])
                     
     def _invalidate_instruction_cache(self, address):
-        global garbage
         address = address & ~1
-        print("Invalidating instruction at %04x" % address)
         if address in self.translation_buffer:
-            tb = self.translation_buffer[address]
-            garbage.append(tb)
-            self.translation_buffer[address] = None
             del self.translation_buffer[address]
         
     def __str__(self):
