@@ -728,6 +728,19 @@ class SXTInst(UnaryInst):
         cpu.set_flag(CPUFlags.Z, result == 0)
         self.op.set(cpu, result)
         super().eval(cpu)
+        
+    def generate_llvm(self, tb):
+        self._advance_pc(tb)
+        val = self.op.get_llvm_value(tb)
+        result = tb.builder.sext(tb.builder.trunc(val, llir.IntType(8)), llir.IntType(16))
+        self.op.set_llvm_value(tb, result)
+        tb.set_flag(CPUFlags.V, llir.Constant(llir.IntType(1), 0))
+        tb.set_flag(CPUFlags.C, tb.builder.icmp_unsigned("!=", result, llir.Constant(result.type, 0), "flag_C"))
+        tb.set_flag(CPUFlags.Z, tb.builder.icmp_unsigned("==", result, llir.Constant(result.type, 0), "flag_Z"))
+        tb.set_flag(CPUFlags.N, tb.builder.icmp_unsigned(
+            "!=", 
+            tb.builder.and_(result, llir.Constant(result.type, 1 << (result.type.width - 1))), 
+            llir.Constant(result.type, 0), "flag_N"))
   
 class PushInst(UnaryInst):
     def __init__(self, op, size):
@@ -1109,6 +1122,22 @@ class DaddInst(BinaryInst):
         tb.set_flag(CPUFlags.Z, tb.builder.icmp_unsigned("==", result, llir.Constant(result.type, 0)))
         tb.set_flag(CPUFlags.V, llir.Constant(llir.IntType(1), 0))
         tb.builder.ret_void()
+        
+class DecR15JnzInst(MSP430Instruction):
+    def __init__(self):
+        self.mnem = "dec r15; jnz"
+        super().__init__(4)
+        
+    def generate_llvm(self, tb):
+        self._advance_pc(tb)
+        tb.set_register(15, llir.Constant(llir.IntType(16), 0))
+        tb.set_flag(CPUFlags.C, llir.Constant(llir.IntType(1), 0))
+        tb.set_flag(CPUFlags.V, llir.Constant(llir.IntType(1), 0))
+        tb.set_flag(CPUFlags.N, llir.Constant(llir.IntType(1), 0))
+        tb.set_flag(CPUFlags.Z, llir.Constant(llir.IntType(1), 1))
+    
+    def __str__(self):
+        return self.mnem
 
 class Memory():
     def __init__(self):
@@ -1237,7 +1266,7 @@ class MSP430Cpu():
             print("Generating random number")
             self.state.set_register(15, 0)
         elif gate_num == 0x7f:
-            sys.stderr.write("Deadbolt unlocked. You're done.")
+            sys.stderr.write("Deadbolt unlocked. You're done.\n")
             sys.exit(0)
         else:
             print("Unhandled callgate code: 0x%02x" % gate_num)
@@ -1297,6 +1326,10 @@ class MSP430Cpu():
         # see http://www.ece.utep.edu/courses/web3376/Links_files/MSP430%20Quick%20Reference.pdf
         # and http://www.ti.com/lit/ug/slau144j/slau144j.pdf
         opcode = self.state.read_memory(address, 2)
+        #The obfuscated code uses a busy waiting loop to slow things down. Just interpret the loop as
+        #one instruction.
+        if opcode == 0x831f or opcode == 0x533f and self.state.read_memory(address + 2, 2) == 0x23fe:
+            return DecR15JnzInst()
         if opcode & 0xe000 == 0x2000:
             return JumpInst((sext(opcode & 0x3ff, 10) * 2) & 0xffff, Condition((opcode >> 10) & 7))
         elif opcode & 0xfc00 == 0x1000:
@@ -1490,6 +1523,7 @@ def main(args, env):
 #                        data["regs"][15]))
                 # cpu.step(True)
                 cpu.step(True)
+                print("SR: %04x" % cpu.state.registers[2])
                 if cpu.state.is_cpuoff():
                     sys.exit(0)
                 lastinst = data["insn"]
@@ -1497,6 +1531,9 @@ def main(args, env):
     else:
         while True:
             cpu.step(True)
+            if cpu.state.is_cpuoff():
+                print("Got CPUOFF")
+                sys.exit(0)
 
 def parse_args():
     parser = argparse.ArgumentParser()
