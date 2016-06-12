@@ -90,25 +90,38 @@ class TranslationBlock(object):
     def read_memory(self, address):
         int32Ty = llir.IntType(32)
         int16Ty = llir.IntType(16)
-        addr_val = self.builder.ptrtoint(address, int32Ty)
+        addr_val = self.builder.ptrtoint(address, int32Ty, "address")
         if address.type.pointee.width == 8:
             gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_memory_gep_indices(addr_val), True, "ptr_mem")
-            return self.builder.load(gep)
+            value = self.builder.load(gep, "value")
         elif address.type.pointee.width == 16:
             gep_lo = self.builder.gep(self.function.args[0], CpuStateStruct.get_memory_gep_indices(addr_val), True, "ptr_mem")
             addr_hi = self.builder.add(addr_val, llir.Constant(int32Ty, 1))
             gep_hi = self.builder.gep(self.function.args[0], CpuStateStruct.get_memory_gep_indices(addr_hi), True, "ptr_mem")
             
             val_lo = self.builder.load(gep_lo)
-            val_lo = self.builder.zext(val_lo, int16Ty)
+            val_lo = self.builder.zext(val_lo, int16Ty, "value_low")
             val_hi = self.builder.load(gep_hi)
             val_hi = self.builder.zext(val_hi, int16Ty)
-            val_hi = self.builder.shl(val_hi, llir.Constant(int16Ty, 8))
-            val = self.builder.or_(val_hi, val_lo)
-            return val
+            val_hi = self.builder.shl(val_hi, llir.Constant(int16Ty, 8), "value_high")
+            value = self.builder.or_(val_hi, val_lo, "values")
         else:
             assert(False)
-            
+        
+        #Add instrumentation for monitoring memory reads
+        monread_gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_monitor_memory_read_gep_indices(), "ptr_monitor_memory_read")
+        monread_func = self.builder.load(monread_gep, "monitor_memory_read")
+        notnull = self.builder.icmp_unsigned("!=", monread_func, llir.Constant(monread_func.type, "null"))
+        bb_monread = self.function.append_basic_block("monitor_read")
+        bb_next = self.function.append_basic_block("body_continuation")
+        self.builder.cbranch(notnull, bb_monread, bb_next)
+        monread_builder = llir.IRBuilder(bb_monread)
+        monread_builder.call(monread_func, [monread_builder.ptrtoint(address, int16Ty), llir.Constant(int16Ty, int(address.type.pointee.width / 8)), self.builder.zext(value, int16Ty)])
+        monread_builder.branch(bb_next)
+        self.builder = llir.IRBuilder(bb_next)
+        
+        return value
+        
     def write_memory(self, address, value):
         int32Ty = llir.IntType(32)
         int16Ty = llir.IntType(16)
@@ -118,13 +131,13 @@ class TranslationBlock(object):
             gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_memory_gep_indices(addr_val), True, "ptr_mem")
             self.builder.store(value, gep)
         elif address.type.pointee.width == 16:
-            val_lo = self.builder.trunc(value, llir.IntType(8))
+            val_lo = self.builder.trunc(value, llir.IntType(8), "value_low")
             val_hi = self.builder.lshr(value, llir.Constant(value.type, 8))
-            val_hi = self.builder.trunc(val_hi, llir.IntType(8))
+            val_hi = self.builder.trunc(val_hi, llir.IntType(8), "value_high")
             
-            gep_lo = self.builder.gep(self.function.args[0], CpuStateStruct.get_memory_gep_indices(addr_val), True, "ptr_mem")
+            gep_lo = self.builder.gep(self.function.args[0], CpuStateStruct.get_memory_gep_indices(addr_val), True, "ptr_mem_low")
             addr_hi = self.builder.add(addr_val, llir.Constant(addr_val.type, 1))
-            gep_hi = self.builder.gep(self.function.args[0], CpuStateStruct.get_memory_gep_indices(addr_hi), True, "ptr_mem")
+            gep_hi = self.builder.gep(self.function.args[0], CpuStateStruct.get_memory_gep_indices(addr_hi), True, "ptr_mem_high")
             
             self.builder.store(val_lo, gep_lo)
             self.builder.store(val_hi, gep_hi)
@@ -140,10 +153,25 @@ class TranslationBlock(object):
         invinst_gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_invalidate_instruction_cache_gep_indices(), "ptr_invalidate_instruction_cache")
         invinst_func = self.builder.load(invinst_gep, "invalidate_instruction_cache")
         self.builder.call(invinst_func, [self.builder.ptrtoint(address, int16Ty)])
+        
+        #Add instrumentation for monitoring memory writes
+        monwrite_gep = self.builder.gep(self.function.args[0], CpuStateStruct.get_monitor_memory_write_gep_indices(), "ptr_monitor_memory_write")
+        monwrite_func = self.builder.load(monwrite_gep, "monitor_memory_write")
+        notnull = self.builder.icmp_unsigned("!=", monwrite_func, llir.Constant(monwrite_func.type, "null"))
+        bb_monwrite = self.function.append_basic_block("monitor_write")
+        bb_next = self.function.append_basic_block("body_continuation")
+        self.builder.cbranch(notnull, bb_monwrite, bb_next)
+        monwrite_builder = llir.IRBuilder(bb_monwrite)
+        monwrite_builder.call(monwrite_func, [monwrite_builder.ptrtoint(address, int16Ty), llir.Constant(int16Ty, int(address.type.pointee.width / 8)), self.builder.zext(value, int16Ty)])
+        monwrite_builder.branch(bb_next)
+        self.builder = llir.IRBuilder(bb_next)
             
-INVALIDATE_INSTRUCTION_CACHE_FUNC = cty.CFUNCTYPE(None, cty.c_uint16)
+
         
 class CpuStateStruct(cty.Structure):
+    INVALIDATE_INSTRUCTION_CACHE_FUNC = cty.CFUNCTYPE(None, cty.c_uint16)
+    MONITOR_READ_MEMORY_FUNC = cty.CFUNCTYPE(None, cty.c_uint16, cty.c_uint16, cty.c_uint16)
+    MONITOR_WRITE_MEMORY_FUNC = cty.CFUNCTYPE(None, cty.c_uint16, cty.c_uint16, cty.c_uint16)
     
     fields = [
         ("registers", cty.c_uint16 * 16, llir.ArrayType(llir.IntType(INT_BITS), 16)),
@@ -152,7 +180,12 @@ class CpuStateStruct(cty.Structure):
         ("N", cty.c_uint16, llir.IntType(INT_BITS)),
         ("V", cty.c_uint16, llir.IntType(INT_BITS)),
         ("memory", cty.c_uint8 * 0x10000, llir.ArrayType(llir.IntType(8), 0x10000)),
-        ("invalidate_instruction_cache", INVALIDATE_INSTRUCTION_CACHE_FUNC, llir.PointerType(llir.FunctionType(llir.VoidType(), [llir.IntType(16)])))]
+        ("invalidate_instruction_cache", INVALIDATE_INSTRUCTION_CACHE_FUNC, llir.PointerType(llir.FunctionType(llir.VoidType(), 
+            [llir.IntType(16)]))),
+        ("monitor_read_memory", MONITOR_READ_MEMORY_FUNC, llir.PointerType(llir.FunctionType(llir.VoidType(), 
+            [llir.IntType(16), llir.IntType(16), llir.IntType(16)]))),
+        ("monitor_write_memory", MONITOR_WRITE_MEMORY_FUNC, llir.PointerType(llir.FunctionType(llir.VoidType(), 
+            [llir.IntType(16), llir.IntType(16), llir.IntType(16)])))]
     
     _fields_ = [(name, ctype) for name, ctype, _ in fields]
         
@@ -184,6 +217,16 @@ class CpuStateStruct(cty.Structure):
     def get_invalidate_instruction_cache_gep_indices(clazz):
         return (llir.Constant(llir.IntType(32), 0), 
                 llir.Constant(llir.IntType(32), 6))
+                
+    @classmethod
+    def get_monitor_memory_read_gep_indices(clazz):
+        return (llir.Constant(llir.IntType(32), 0), 
+                llir.Constant(llir.IntType(32), 7))
+                
+    @classmethod
+    def get_monitor_memory_write_gep_indices(clazz):
+        return (llir.Constant(llir.IntType(32), 0), 
+                llir.Constant(llir.IntType(32), 8))
         
     def get_register(self, reg):
         if reg == 2:
@@ -1101,7 +1144,7 @@ class MSP430Cpu():
         self.state = CpuStateStruct()
         self.state.write_memory(0x10, 2, 0x4130)
         self.state.set_register(0, 0x4400)
-        self.state.invalidate_instruction_cache = INVALIDATE_INSTRUCTION_CACHE_FUNC(self._invalidate_instruction_cache)
+        self.state.invalidate_instruction_cache = CpuStateStruct.INVALIDATE_INSTRUCTION_CACHE_FUNC(self._invalidate_instruction_cache)
         self.translation_context = TranslationContext()
         self.translation_buffer = {}
         
@@ -1128,7 +1171,7 @@ class MSP430Cpu():
             assert(tb.native is not None)
             if verbose:
                 print(tb.instructions[0])
-                #print(str(self))
+                print(str(self))
 #                print("%04x: %s" % (0xdff0, " ".join(["%02x%02x" % (x[1], x[0]) for x in zip(*[iter(self.state.memory[0xdff0:0xdff0+16])] * 2)])))
 #                print("%04x: %s" % (0xe000, " ".join(["%02x%02x" % (x[1], x[0]) for x in zip(*[iter(self.state.memory[0xe000:0xe000+16])] * 2)])))
             tb.native(self.state)
@@ -1348,21 +1391,21 @@ def registers_equal(x, y):
         (y[2] & (1 << CPUFlags.C.value) != 0) == (x.state.C != 0) and \
         (y[2] & (1 << CPUFlags.Z.value) != 0) == (x.state.Z != 0) and \
         (y[2] & (1 << CPUFlags.N.value) != 0) == (x.state.N != 0) and \
-        (y[2] & (1 << CPUFlags.V.value) != 0) == (x.state.V != 0)
-
-cpu = None        
-
-def print_val(val):
-    print("print_val: 0x%04x, mem[val] = 0x%04x" % (val, cpu.state.read_memory(val, 2)))
-    #print("%04x: %s" % (0xdff0, " ".join(["%02x%02x" % (x[1], x[0]) for x in zip(*[iter(cpu.state.memory[0xdff0:0xdff0+16])] * 2)])))
-    #print("%04x: %s" % (0xe000, " ".join(["%02x%02x" % (x[1], x[0]) for x in zip(*[iter(cpu.state.memory[0xe000:0xe000+16])] * 2)])))
+        (y[2] & (1 << CPUFlags.V.value) != 0) == (x.state.V != 0)   
+        
+def monitor_memory_read(address, size, value):
+    print("memory_read @0x%04x[%d] = 0x%04x" % (address, size, value))
+    
+def monitor_memory_write(address, size, value):
+    print("memory_write @0x%04x[%d] = 0x%04x" % (address, size, value))
 
 def main(args, env):
-    global cpu
     llvm.initialize()
     llvm.initialize_native_target()
     llvm.initialize_native_asmprinter()
     cpu = MSP430Cpu()
+    cpu.state.monitor_memory_read = CpuStateStruct.MONITOR_READ_MEMORY_FUNC(monitor_memory_read)
+    cpu.state.monitor_memory_write = CpuStateStruct.MONITOR_WRITE_MEMORY_FUNC(monitor_memory_write)
 
     if args.hex:
         cpu.input = [int("".join(x), 16) for x in zip(*[iter(args.input)] * 2)]
@@ -1397,6 +1440,7 @@ def main(args, env):
                             data["regs"][9], data["regs"][10], data["regs"][11],
                             data["regs"][12], data["regs"][13], data["regs"][14], 
                             data["regs"][15], "".join(x.name for x in (CPUFlags.C, CPUFlags.Z, CPUFlags.N, CPUFlags.V) if (data["regs"][2] & (1 << x.value)) != 0)))
+                    print("%04x: %s" % (0x2600, " ".join(["%02x%02x" % (x[1], x[0]) for x in zip(*[iter(cpu.state.memory[0x2600:0x2600+16])] * 2)])))
                     raise RuntimeError("Mismatch between registers in tracefile line %d" % (linenum, ))
                 # for memline in ["".join(x) for x in zip(*[iter(data["updatememory"])] * 36)]:
                 #     addr = int(memline[0:4], 16)
