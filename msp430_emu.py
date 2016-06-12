@@ -539,7 +539,7 @@ class RegisterIndirectOperand(Operand):
     def get_llvm_value(self, tb):
         reg = tb.get_register(self.reg)
         addr = tb.builder.inttoptr(reg, llir.PointerType(llir.IntType(self.size * 8)))
-        return tb.builder.load(addr)
+        return tb.read_memory(addr)
         
     def __str__(self):
         return "@%s" % (self._regname(self.reg), )
@@ -1321,12 +1321,13 @@ class MSP430Cpu():
                     raise RuntimeError("Unknown SREC record type: " + data[0])
                     
     def _invalidate_instruction_cache(self, address):
+        global garbage
         address = address & ~1
         print("Invalidating instruction at %04x" % address)
         if address in self.translation_buffer:
             tb = self.translation_buffer[address]
-            del tb.execution_engine
-            del tb
+            garbage.append(tb)
+            self.translation_buffer[address] = None
             del self.translation_buffer[address]
         
     def __str__(self):
