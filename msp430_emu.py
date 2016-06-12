@@ -104,7 +104,7 @@ class TranslationBlock(object):
             val_hi = self.builder.load(gep_hi)
             val_hi = self.builder.zext(val_hi, int16Ty)
             val_hi = self.builder.shl(val_hi, llir.Constant(int16Ty, 8), "value_high")
-            value = self.builder.or_(val_hi, val_lo, "values")
+            value = self.builder.or_(val_hi, val_lo, "value")
         else:
             assert(False)
         
@@ -894,7 +894,10 @@ class XorInst(BinaryInst):
         return (result, "NZ")
     
     def _generate_llvm(self, tb, src, dst):
-        result = tb.builder.xor(src(), dst())
+        #Evaluate arguments before to make sure LLVM is consistent
+        src = src()
+        dst = dst()
+        result = tb.builder.xor(src, dst)
         self._set_logical_flags(tb, "CVNZ", result)
         return result
         
@@ -1160,7 +1163,12 @@ class MSP430Cpu():
         #        print(str(self.translation_context.module))
    
                 #print(str(tb.module))
-                tb.compiled_module = llvm.parse_assembly(str(tb.module))
+                try:
+                    tb.compiled_module = llvm.parse_assembly(str(tb.module))
+                except RuntimeError:
+                    print(tb.instructions[0])
+                    print(str(tb.module))
+                    raise
                 tb.target_machine = llvm.Target.from_default_triple().create_target_machine()
                 tb.execution_engine = llvm.create_mcjit_compiler(tb.compiled_module, tb.target_machine)
                 tb.execution_engine.finalize_object()
@@ -1171,7 +1179,7 @@ class MSP430Cpu():
             assert(tb.native is not None)
             if verbose:
                 print(tb.instructions[0])
-                print(str(self))
+                #print(str(self))
 #                print("%04x: %s" % (0xdff0, " ".join(["%02x%02x" % (x[1], x[0]) for x in zip(*[iter(self.state.memory[0xdff0:0xdff0+16])] * 2)])))
 #                print("%04x: %s" % (0xe000, " ".join(["%02x%02x" % (x[1], x[0]) for x in zip(*[iter(self.state.memory[0xe000:0xe000+16])] * 2)])))
             tb.native(self.state)
@@ -1404,8 +1412,8 @@ def main(args, env):
     llvm.initialize_native_target()
     llvm.initialize_native_asmprinter()
     cpu = MSP430Cpu()
-    cpu.state.monitor_memory_read = CpuStateStruct.MONITOR_READ_MEMORY_FUNC(monitor_memory_read)
-    cpu.state.monitor_memory_write = CpuStateStruct.MONITOR_WRITE_MEMORY_FUNC(monitor_memory_write)
+#    cpu.state.monitor_read_memory = CpuStateStruct.MONITOR_READ_MEMORY_FUNC(monitor_memory_read)
+#    cpu.state.monitor_write_memory = CpuStateStruct.MONITOR_WRITE_MEMORY_FUNC(monitor_memory_write)
 
     if args.hex:
         cpu.input = [int("".join(x), 16) for x in zip(*[iter(args.input)] * 2)]
